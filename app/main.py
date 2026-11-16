@@ -1,10 +1,14 @@
 """泳道拆样台:上传 R1/R2/I1 与样本索引 CSV,按样本拆出成对读段。
 
 发布模型:
-- 处理中:上传件与半成品输出都在 staging/<token>/,不对外可见。
-- 成功:输出目录整体 os.rename 到 published/<运行号>/,同事务写入计数,
-  之后状态置为 published。任何一步失败都不会留下半套已发布文件。
-- 失败/中断:状态置 failed,暂存与可能的半成品目录被清理;同一运行号可重试。
+- 处理中:上传件与半成品输出都在 staging/<token>/,不对外可见。每次尝试有
+  自己的随机 token,暂存目录彼此隔离。
+- 成功:输出目录(含本尝试的 .attempt 归属标记)整体 os.rename 到
+  published/<运行号>/,同事务写入计数,之后状态置为 published。
+  任何一步失败都不会留下半套已发布文件。
+- 失败/中断:状态置 failed,只清理**本尝试**的残留——暂存目录按 token 隔离
+  可直接删;发布目录经 reclaim_published 凭归属标记认领,属于同号重试新尝试
+  的已发布文件一律原样还原,绝不误删。同一运行号可重试。
 - 已发布:同一运行号拒绝改写。
 """
 import os
@@ -29,6 +33,9 @@ from .samples import load_samples
 RUN_NUMBER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 STATUS_LABELS = {"processing": "处理中", "published": "已发布", "failed": "失败"}
 UNDETERMINED = "undetermined"
+ATTEMPT_MARKER = ".attempt"  # 发布目录内的尝试归属标记,内容为暂存 token
+TRASH_PREFIX = ".trash-"     # 认领发布目录时临时挪入的隔离目录前缀
+
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -36,6 +43,16 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def attempt_token(staging: Path) -> str:
+    """一次处理尝试的身份:暂存目录名(随机 token)。"""
+    return Path(staging).name
+
+
+def write_attempt_marker(out_dir: Path, token: str) -> None:
+    """在半成品输出目录写入归属标记,随 os.rename 一并原子进入发布区。"""
+    (Path(out_dir) / ATTEMPT_MARKER).write_text(token, encoding="ascii")
 
 
 def _remove(path) -> None:
@@ -49,16 +66,103 @@ def _remove(path) -> None:
             pass
 
 
+def reclaim_published(final: Path, token: str) -> None:
+    """失败/中断清理时,只回收**本尝试**可能留下的发布目录。
+
+    同号重试的新尝试可能已经把自己的输出原子改名到同一 final 路径。为避免
+    "旧尝试删新尝试文件"的交错事故,这里先把目标整体挪到同卷的 .trash-<token>
+    隔离目录(同卷 rename 原子),再凭 .attempt 归属标记判定:
+    - 标记属于本 token,或目录无标记(旧版本遗留的无主半成品):确认是本尝试
+      的残留,安全删除;
+    - 标记属于其他尝试:这是新尝试的已发布文件,原样还原,绝不删除;
+    - 还原失败时宁可留在 .trash 里(启动恢复会统一清扫),也不能误删他人文件。
+    """
+    final = Path(final)
+    if not final.exists() and not final.is_symlink():
+        return
+    trash = _trash_path(final, token)
+    try:
+        os.rename(final, trash)  # 同一数据卷内原子挪走,检查与删除之间无人能改归属
+    except FileNotFoundError:
+        return
+    owner = _read_owner(trash)
+    if owner == token or owner == "":
+        _remove(trash)
+        return
+    try:  # 属于其他尝试(同号重试的新尝试):完整还原
+        os.rename(trash, final)
+    except OSError:
+        # 极端情况下还原不回原路径;保留在隔离目录交由启动恢复处理,
+        # 绝不能 rmtree 掉不属于本尝试的文件。
+        pass
+
+
+def adopt_stale_publish(final: Path, token: str, run_id: int) -> None:
+    """新尝试发布前,清掉同路径上**确认无主**的旧残留。
+
+    能走到这里说明本运行号当前只有本尝试这一行 processing 记录(run_number
+    唯一;已发布行会在提交时被 409 挡下)。因此路径上若已有目录,只可能是
+    已被替换的旧尝试来不及回收的残留:挪走后凭标记再确认一次归属,
+    只要发现仍有别的存活处理行就原样还原,绝不强删。
+    """
+    final = Path(final)
+    if not final.exists() and not final.is_symlink():
+        return
+    trash = _trash_path(final, token)
+    try:
+        os.rename(final, trash)
+    except FileNotFoundError:
+        return
+    owner = _read_owner(trash)
+    if owner == token:  # 自己的输出不应已在发布路径,还原并交上层报错
+        try:
+            os.rename(trash, final)
+        except OSError:
+            pass
+        raise RuntimeError(f"发布目录已存在且属于当前尝试: {final}")
+    with db_conn(db_path()) as conn:
+        other_live = conn.execute(
+            "SELECT 1 FROM runs WHERE run_number=? AND id<>? AND status='processing' LIMIT 1",
+            (final.name, run_id),
+        ).fetchone()
+    if other_live:  # 理论上被唯一约束挡死,保守处理:原样还原
+        os.rename(trash, final)
+        raise RuntimeError(f"发布目录正被其他尝试占用: {final}")
+    _remove(trash)
+
+
+def _trash_path(final: Path, token: str) -> Path:
+    trash = final.parent / f"{TRASH_PREFIX}{token}"
+    n = 1
+    while trash.exists() or trash.is_symlink():
+        trash = final.parent / f"{TRASH_PREFIX}{token}-{n}"
+        n += 1
+    return trash
+
+
+def _read_owner(trash: Path) -> str:
+    try:
+        return (trash / ATTEMPT_MARKER).read_text(encoding="ascii").strip()
+    except (FileNotFoundError, UnicodeDecodeError, OSError):
+        return ""
+
+
 def recover_interrupted() -> None:
     """启动恢复:凡未走到 published 的运行一律标失败并清掉半成品,
-    保证发布区里只存在完整运行的完整文件。"""
+    保证发布区里只存在完整运行的完整文件。
+
+    启动时本进程没有任何存活的处理线程,因此:
+    - .trash-* 隔离目录都是进程被杀时认领流程的遗留,可无条件清扫;
+    - 暂存目录与发布区孤儿目录同理,此时不存在"新尝试在用"的可能。
+    """
     with db_conn(db_path()) as conn:
         stale = conn.execute(
             "SELECT id, run_number, staging_dir FROM runs WHERE status = 'processing'"
         ).fetchall()
         for row in stale:
             conn.execute(
-                "UPDATE runs SET status='failed', error=?, updated_at=? WHERE id=?",
+                "UPDATE runs SET status='failed', error=?, updated_at=? "
+                "WHERE id=? AND status='processing'",
                 ("进程中断,未完成即停止;可用同一运行号重新提交", utcnow(), row["id"]),
             )
         published = {
@@ -67,13 +171,17 @@ def recover_interrupted() -> None:
         }
     for row in stale:
         _remove(row["staging_dir"])
-        _remove(published_dir() / row["run_number"])
+        # 仅认领本尝试(凭暂存 token)的发布残留;他人的目录会被原样还原
+        reclaim_published(published_dir() / row["run_number"], attempt_token(row["staging_dir"]))
     if staging_dir().exists():
         for child in staging_dir().iterdir():  # 无主的暂存目录一并清理
             _remove(child)
-    if published_dir().exists():
-        for child in published_dir().iterdir():
-            if child.name not in published:
+    pub = published_dir()
+    if pub.exists():
+        for child in list(pub.iterdir()):
+            if child.name.startswith(TRASH_PREFIX):
+                _remove(child)  # 启动期无存活线程,隔离目录全是无主遗留
+            elif child.name not in published:
                 _remove(child)
     with db_conn(db_path()) as conn:  # 已发布但文件丢失:不允许提供残缺下载
         for num in published:
@@ -128,6 +236,7 @@ def process_run(run_id: int) -> None:
         return
     run_number = run["run_number"]
     staging = Path(run["staging_dir"])
+    token = attempt_token(staging)
     uploads = staging / "uploads"
     out = staging / "out"
     final = published_dir() / run_number
@@ -139,8 +248,9 @@ def process_run(run_id: int) -> None:
             str(uploads / "i1.fastq"), sample_list, str(out),
         )
         write_log(out / "demux.log", run, sample_list, stats)
-        if final.exists():
-            raise RuntimeError(f"发布目录已存在: {final}")
+        write_attempt_marker(out, token)  # 归属标记随输出一起原子进入发布区
+        # 同路径若残留旧尝试的发布目录,凭标记确认无主后清走;有主则报错不抢
+        adopt_stale_publish(final, token, run_id)
         os.rename(out, final)  # 同一数据卷内原子移动:先完整落盘,再发布
         with db_conn(db_path()) as conn:
             updated = conn.execute(
@@ -159,14 +269,18 @@ def process_run(run_id: int) -> None:
                     (run_id, sid, index_of.get(sid, ""), pairs, corrected),
                 )
         _remove(staging)
-    except Exception as exc:  # 任何失败:标失败 + 清半成品,不发布
+    except Exception as exc:  # 任何失败:标失败 + 清本尝试的半成品,不发布
         with db_conn(db_path()) as conn:
+            # 仅当本行仍是 processing 时才落失败:同号重试已删行/改状态时,
+            # 旧尝试不得覆盖新尝试的状态
             conn.execute(
-                "UPDATE runs SET status='failed', error=?, updated_at=? WHERE id=?",
+                "UPDATE runs SET status='failed', error=?, updated_at=? "
+                "WHERE id=? AND status='processing'",
                 (str(exc), utcnow(), run_id),
             )
-        _remove(staging)
-        _remove(final)
+        _remove(staging)  # 暂存目录按 token 隔离,只可能是本尝试自己的
+        # 发布目录须凭归属标记认领:若同号重试的新尝试已在此发布,原样保留
+        reclaim_published(final, token)
 
 
 # ---------------------------------------------------------------- 页面与接口

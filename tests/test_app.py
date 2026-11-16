@@ -48,17 +48,6 @@ def make_inputs(reads=READS):
     return fq(r1).encode(), fq(r2).encode(), fq(i1).encode(), SAMPLES_CSV.encode()
 
 
-@pytest.fixture()
-def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
-    from fastapi.testclient import TestClient
-    from app.main import app
-
-    with TestClient(app) as c:
-        c.data_dir = tmp_path / "data"
-        yield c
-
-
 def submit(client, run_number, r1, r2, i1, samples):
     return client.post(
         "/runs",
